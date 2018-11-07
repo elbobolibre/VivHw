@@ -1,0 +1,14 @@
+#!/bin/bash
+
+export GOPATH=$(cd "$(dirname "$0")"; pwd)
+
+if [ "X$1" = "X-g" ]
+then
+    echo $GOPATH
+    exit 0
+fi
+
+MINIMUM_GO_VERSION=1.10
+
+cd "$GOPATH"
+go install ...line-server
