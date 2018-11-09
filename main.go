@@ -23,9 +23,9 @@ var total_clients uint64
 //  ServerState object and methods - convenience object for managing the server
 //
 type ServerState struct {
-    rw_lock sync.RWMutex
+    rw_lock *sync.RWMutex
     shutdown bool
-    wg sync.WaitGroup
+    wg *sync.WaitGroup
 }
 
 func (s *ServerState) IsShutdown() bool {
@@ -78,6 +78,7 @@ func create_file_index(filename string) {
 // Purpose: Retrieves the text associated with the specified line number
 //
 func get_text(client net.Conn, line uint64) string {
+    return ""
 }
 
 //
@@ -96,17 +97,17 @@ func client_handler(client net.Conn, timeout int, state *ServerState) {
     }()
 
     validCommand := regexp.MustCompile(`(^GET (\d+)\r\n$|^QUIT\r\n$|^SHUTDOWN\r\n$)`)
-    timeoutDuration := timeout * time.Second
+    timeoutDuration := time.Duration(timeout) * time.Second
     reader := bufio.NewReader(client)
     done := false
-    var msg string
 
     // Client command-response loop
     for !done {
         // Set max read timeout
         client.SetReadDeadline(time.Now().Add(timeoutDuration))
 
-        if msg, err := reader.ReadString('\n'); err != nil {
+        msg, err := reader.ReadString('\n')
+        if err != nil {
             // Use timeout event as opportunity to check for server shutdown
             if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
                 if (!state.IsShutdown()) {
@@ -136,7 +137,7 @@ func client_handler(client net.Conn, timeout int, state *ServerState) {
         default:    // Per regex matching, this can only be the GET nnnn command
             if line, err2 := strconv.ParseUint(s[2], 10, 64); err2 == nil {
                 text := get_text(client, line)
-                if text != nil {
+                if text != "" {
                     msg = "OK\r\n" + text + "\r\n"
                 } else {
                     msg  = "ERR\r\n"
@@ -155,20 +156,22 @@ func client_handler(client net.Conn, timeout int, state *ServerState) {
 // Purpose: Waits for client connections. Dispatches one new client_handler per client connection.
 //
 func wait_for_clients(listen_conn net.Listener, timeout int, state *ServerState) {
+
     tcplistener := listen_conn.(*net.TCPListener)
 
     // Listener closure
     defer func() {
-        fmt.Printf("Closing socket to %s\n", listen_conn.RemoteAddr().String())
+        fmt.Printf("Closing listener on %s:%s\n", listen_conn.Addr().Network(), listen_conn.Addr().String())
         listen_conn.Close() // Close listener socket
         state.Done()        // Decrement the WaitGroup
     }()
 
     // Main loop for launching new clients
     for {
-	    tcplistener.SetDeadline(time.Now().Add(timeout * time.Second))
+	    tcplistener.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
 
-        if client, err := listen_conn.Accept(); err != nil {
+        client, err := listen_conn.Accept()
+        if err != nil {
             // Use timeout event as opportunity to check for server shutdown
             if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
                 if (!state.IsShutdown()) {
@@ -216,13 +219,14 @@ func main() {
     create_file_index(flag.Arg(0))
 
     listen_addr := ":" + strconv.Itoa(listen_port)
-    if listen_conn, err := net.Listen("tcp4", listen_port); err != nil {
+    listen_conn, err := net.Listen("tcp4", listen_addr)
+    if err != nil {
         fmt.Println("Listen error: ", err)
         return
     }
 
     // Instantiate our server management object
-    state := ServerState{sync.RWMutex, false, sync.WaitGroup}
+    state := ServerState{new(sync.RWMutex), false, new(sync.WaitGroup)}
 
     // Wait for new client connections until the SHTUDOWN is received by one of the clients
     wait_for_clients(listen_conn, 2, &state)
