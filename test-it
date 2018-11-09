@@ -1,0 +1,133 @@
+#!/bin/bash
+
+USAGE="usage: $(basename "$0") [args] path
+
+    -m addr  = line server hostname
+    -p num   = line server port
+    path     = file served by the line server
+
+Run simple tests to see if the line server is working.
+"
+
+HOST="localhost"
+PORT=6666
+
+while getopts "hm:p:" opt
+do
+    case "$opt" in
+    h) echo "$USAGE"; exit 0;;
+    m) HOST="$OPTARG";;
+    p) PORT="$OPTARG";;
+    *) exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [[ $# -ne 1 ]]
+then
+    echo "$USAGE " >&2
+    exit 1
+fi
+
+
+FILE="$1"
+MAX_LINENO=$(wc -l "$FILE" | awk '{print $1}')
+
+
+# Can we get each line in the file?
+# This test sequentially fetches each line from your server and compares it to
+# the actual line in the file.
+# To troubleshoot why this test is failing, try:
+#
+#   $ printf "GET 1\r\n" | nc localhost $MYPORT   # fetch line from server
+#   $ sed '1!d' < $MYFILE                         # get line from file
+#
+# If the fetched line and line from the file look the same, try:
+#
+#   $ printf "GET 1\r\n" | nc localhost $MYPORT | od -c
+#   $ sed '1!d' < $MYFILE | od -c
+CanGetAllLines()
+{
+    printf "${FUNCNAME[0]} ... "
+    lineno=1
+    while [[ "$lineno" -le "$MAX_LINENO" ]]
+    do
+        expect=$(printf "OK\r\n%s\r\n" "$(sed "${lineno}!d" < "$FILE")")
+        actual=$(printf "GET $lineno\r\n" | nc "$HOST" "$PORT")
+        if [[ "X$actual" != "X$expect" ]]
+        then
+            printf "fail\n"
+            echo "ERROR: ${FUNCNAME[0]}: line $lineno:" >&2
+            echo "expected:" >&2
+            echo "$expect" | od -c | sed 's#^#    #'
+            echo "actual:" >&2
+            echo "$actual" | od -c | sed 's#^#    #'
+            return
+        fi
+        lineno=$((lineno + 1))
+    done
+    printf "pass\n"
+}
+
+# Can we make multiple requests on one connection?
+# This test fetches the first 3 lines of the file from your server in one
+# netcat invocation.   The server should return all 3 lines, not just
+# the first.
+# To troubleshoot why this test is failing, try:
+#
+#   $ nc localhost $MYPORT
+#   GET 1        <- your input
+#   OK
+#   <line1>
+#   GET 2        <- your input
+#   OK
+#   <line2>
+#   GET 3        <- your input
+#   OK
+#   <line3>
+#   ^D           <- your server should close the connection here, not spin
+CanMakeMultipleRequests()
+{
+    printf "${FUNCNAME[0]} ... "
+    line1=$(sed "1!d" < "$FILE")
+    line2=$(sed "2!d" < "$FILE")
+    line3=$(sed "3!d" < "$FILE")
+    expect=$(printf "OK\r\n${line1}\r\nOK\r\n${line2}\r\nOK\r\n${line3}\r\n")
+    actual=$(printf "GET 1\r\nGET 2\r\nGET 3\r\n" | nc "$HOST" "$PORT")
+
+    if [[ "X$actual" != "X$expect" ]]
+    then
+        printf "fail\n"
+        echo "ERROR: ${FUNCNAME[0]}" >&2
+        echo "expected:" >&2
+        echo "$expect" | od -c | sed 's#^#    #'
+        echo "actual:" >&2
+        echo "$actual" | od -c | sed 's#^#    #'
+        return
+    fi
+    printf "pass\n"
+}
+
+# Can we QUIT a client session and start a new session?
+# This test checks to see if QUIT breaks the connection and leaves the
+# server running.  QUIT should not kill the server.
+CanQuitAndRejoin()
+{
+    printf "${FUNCNAME[0]} ... "
+    line1=$(sed "1!d" < "$FILE")
+    printf "QUIT\r\n" | nc "$HOST" "$PORT" 
+
+    expect=$(printf "OK\r\n${line1}\r\n")
+    actual=$(printf "GET 1\r\n" | nc "$HOST" "$PORT")
+    if [[ "X$actual" != "X$expect" ]]
+    then
+        printf "fail\n"
+        echo "ERROR: ${FUNCNAME[0]} got wrong line after quit" >&2
+        return
+    fi
+    printf "pass\n"
+}
+
+CanGetAllLines
+CanMakeMultipleRequests
+CanQuitAndRejoin

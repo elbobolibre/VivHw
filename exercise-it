@@ -1,0 +1,94 @@
+#!/bin/bash
+
+USAGE="usage: $(basename "$0") [args] path
+
+    -m addr  = line server hostname
+    -p num   = line server port
+    -c num   = num simultaneous clients
+    -n num   = num requests to send per client
+    -d secs  = delay between requests
+    -r       = request random line numbers
+    path     = file served by the line server
+
+Run clients that simultaneouly request lines from the line server.
+Each client will make NUM_REQUESTS GET requests and then QUIT.
+After the last client finishes, the line server is SHUTDOWN.
+
+In one window, run the line server:
+
+    $ line-server -p 1234 myfile
+
+In another window run this exerciser:
+
+    $ line-exerciser -p 1234 myfile
+
+Try requesting random line numbers with:
+
+    $ line-exerciser -r -p 1234 myfile
+"
+
+
+PORT=6666
+NUM_CLIENTS=3
+NUM_REQUESTS=100
+REQUEST_DELAY=0.001
+HOST="localhost"
+ACCESS_PATTERN="sequential"
+SHUTDOWN="yes"
+
+while getopts "c:d:hm:n:p:rs" opt
+do
+    case "$opt" in
+    c) NUM_CLIENTS="$OPTARG";;
+    d) REQUEST_DELAY="$OPTARG";;
+    h) echo "$USAGE"; exit 0;;
+    m) HOST="$OPTARG";;
+    n) NUM_REQUESTS="$OPTARG";;
+    p) PORT="$OPTARG";;
+    r) ACCESS_PATTERN="random";;
+    s) SHUTDOWN="no";;
+    *) exit 1;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [[ $# -ne 1 ]]
+then
+    echo "$USAGE " >&2
+    exit 1
+fi
+
+
+FILE="$1"
+MAX_LINENO=$(wc -l "$FILE" | awk '{print $1}')
+
+trap 'kill -TERM -- -$$' EXIT
+
+for client in $(seq 1 "$NUM_CLIENTS")
+do
+    echo "connecting client-$client to $HOST:$PORT"
+    (
+        (
+            for reqno in $(seq "$NUM_REQUESTS")
+            do
+                case "$ACCESS_PATTERN" in
+                random) lineno=$(( (RANDOM % MAX_LINENO ) + 1)) ;;
+                *)      lineno=$(( (reqno % MAX_LINENO ) + 1)) ;;
+                esac
+                printf "GET $lineno\r\n"
+                sleep "$REQUEST_DELAY"
+            done
+            printf "QUIT\r\n"
+        ) |
+        nc "$HOST" "$PORT" |
+        sed "s#^#client-$client: #"
+    ) &
+done
+
+wait
+
+case "$SHUTDOWN" in
+yes) printf "SHUTDOWN\r\n" | nc "$HOST" "$PORT"
+esac
+
+echo "done"
