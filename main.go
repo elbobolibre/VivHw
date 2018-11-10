@@ -2,6 +2,7 @@ package main
 
 import (
     "bufio"
+    "encoding/binary"
     "flag"
     "fmt"
     "os"
@@ -54,6 +55,27 @@ func (s *ServerState) Wait() {
 }
 
 //
+//  ClientConfig object and methods - contains common client config info
+//
+type ClientConfig struct {
+    source string
+    index  string
+    lines  uint64
+}
+
+func (c *ClientConfig) GetSource() string {
+    return c.source
+}
+
+func (c *ClientConfig) GetIndex() string {
+    return c.index
+}
+
+func (c *ClientConfig) GetLines() uint64 {
+    return c.lines
+}
+
+//
 // Function: init
 //
 // Purpose: Create command line flags
@@ -68,8 +90,51 @@ func init() {
 //
 // Purpose: Create file index
 //
-func create_file_index(filename string) {
-    fmt.Println("TODO")
+func create_file_index(source_file string) (string, uint64) {
+    // Open the source file
+    src, err := os.Open(source_file)
+    if err != nil {
+        fmt.Println(err)
+        return "", uint64(0)
+    }
+
+    // Create/truncate an index file
+    index_file := source_file + ".idx"
+    idx, err := os.Create(index_file)
+    if err != nil {
+        fmt.Println(err)
+        src.Close()
+        return "", uint64(0)
+    }
+
+    defer func() {
+        src.Close()
+        idx.Close()
+    }()
+
+    // Find and mark line beginnings in the source file
+    var offset, eol, lines uint64
+    var output [2]uint64
+    var w_err error
+
+    buffer := make([]byte, 4096)    // Typical Linux page size
+    for n, err := src.Read(buffer); err != nil && n > 1; {
+        eol = uint64(strings.IndexByte(string(buffer), '\n'))
+        if eol >= 0 {
+            // Write index/size of line into index file
+            output[0] = offset
+            output[1]  = uint64(offset + eol + 1)
+            w_err = binary.Write(idx, binary.LittleEndian, output)
+            if w_err != nil {
+                fmt.Println("binary.Write failed:", w_err)
+                break
+            }
+            offset = eol + 1
+            lines++
+        }
+    }
+
+    return index_file, lines
 }
 
 //
@@ -77,8 +142,51 @@ func create_file_index(filename string) {
 //
 // Purpose: Retrieves the text associated with the specified line number
 //
-func get_text(client net.Conn, line uint64) string {
-    return ""
+func get_text(src *os.File, idx *os.File, line uint64, total_lines uint64) string {
+    // Snity check the requested lines against the total number of lines available
+    if line > total_lines {
+        fmt.Printf("Requested line %d exceeds the total number of lines available %d\n", line, total_lines)
+        return ""
+    }
+
+    var offset uint64 = (line + 1) * (8 * 2)
+
+    // Seek to the correct location in the index file
+    _, err := idx.Seek(int64(offset), 0)
+    if err != nil {
+        fmt.Println("Index Seek failed: ", err)
+        return ""
+    }
+
+    var location [2]uint64
+
+    // Retrieve the offset and length of the requested line
+    err2 := binary.Read(idx, binary.LittleEndian, &location)
+    if err2 != nil {
+        fmt.Println("Index binary.Read failed:", err2)
+        return ""
+    }
+
+    // Seek to the correct location in the source file
+    _, err3 := src.Seek(int64(location[0]), 0)
+    if err3 != nil {
+        fmt.Println("Source Seek failed: ", err3)
+        return ""
+    }
+
+    // Retrieve the requested line's text
+    text := make([]byte, location[1])
+    n, err4 := src.Read(text)
+    if err4 != nil {
+        fmt.Println("Source Read failed:", err4)
+        return ""
+    }
+    if n != int(location[1]) {
+        fmt.Printf("Source Read returned %d bytes which is not equal to the requested byte count of %d bytes\n", n, location[1])
+        return ""
+    }
+
+    return string(text)
 }
 
 //
@@ -86,7 +194,7 @@ func get_text(client net.Conn, line uint64) string {
 //
 // Purpose: Validates and executes client commands
 //
-func client_handler(client net.Conn, timeout int, state *ServerState) {
+func client_handler(client net.Conn, timeout int, state *ServerState, cfg *ClientConfig) {
     state.Starting() // Increment the WaitGroup
 
     // client handler closure
@@ -100,6 +208,21 @@ func client_handler(client net.Conn, timeout int, state *ServerState) {
     timeoutDuration := time.Duration(timeout) * time.Second
     reader := bufio.NewReader(client)
     done := false
+
+    // Open the source file
+    src, err := os.Open(cfg.GetSource())
+    if err != nil {
+        fmt.Println(err)
+        return
+    }
+
+    // Open the index file
+    idx, err := os.Open(cfg.GetIndex())
+    if err != nil {
+        fmt.Println(err)
+        src.Close()
+        return
+    }
 
     // Client command-response loop
     for !done {
@@ -136,7 +259,7 @@ func client_handler(client net.Conn, timeout int, state *ServerState) {
             state.InitiateShutdown() // Signal server to exit
         default:    // Per regex matching, this can only be the GET nnnn command
             if line, err2 := strconv.ParseUint(s[2], 10, 64); err2 == nil {
-                text := get_text(client, line)
+                text := get_text(src, idx, line, cfg.GetLines())
                 if text != "" {
                     msg = "OK\r\n" + text + "\r\n"
                 } else {
@@ -155,7 +278,7 @@ func client_handler(client net.Conn, timeout int, state *ServerState) {
 //
 // Purpose: Waits for client connections. Dispatches one new client_handler per client connection.
 //
-func wait_for_clients(listen_conn net.Listener, timeout int, state *ServerState) {
+func wait_for_clients(listen_conn net.Listener, timeout int, state *ServerState, cfg *ClientConfig) {
 
     tcplistener := listen_conn.(*net.TCPListener)
 
@@ -187,7 +310,7 @@ func wait_for_clients(listen_conn net.Listener, timeout int, state *ServerState)
 
         // Launch new client handler
         fmt.Printf("Connection from %s\n", client.RemoteAddr().String())
-        go client_handler(client, 10, state)
+        go client_handler(client, 10, state, cfg)
     }
 }
 
@@ -216,7 +339,10 @@ func main() {
     }
 
     // Pre-process the specified text file
-    create_file_index(flag.Arg(0))
+    index_file, lines := create_file_index(flag.Arg(0))
+    if index_file == "" {
+        return
+    }
 
     listen_addr := ":" + strconv.Itoa(listen_port)
     listen_conn, err := net.Listen("tcp4", listen_addr)
@@ -228,8 +354,11 @@ func main() {
     // Instantiate our server management object
     state := ServerState{new(sync.RWMutex), false, new(sync.WaitGroup)}
 
+    // Instantiate client config object
+    cfg := ClientConfig{flag.Arg(0), index_file, lines}
+
     // Wait for new client connections until the SHTUDOWN is received by one of the clients
-    wait_for_clients(listen_conn, 2, &state)
+    wait_for_clients(listen_conn, 2, &state, &cfg)
 
     state.Wait()   // Wait for all goroutines to exit
 
