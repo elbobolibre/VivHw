@@ -5,8 +5,9 @@ import (
     "encoding/binary"
     "flag"
     "fmt"
-    "os"
+    "io"
     "net"
+    "os"
     "regexp"
     "strconv"
     "strings"
@@ -43,7 +44,7 @@ func (s *ServerState) InitiateShutdown() {
 }
 
 func (s *ServerState) Starting() {
-    s.wg.Done()
+    s.wg.Add(1)
 }
 
 func (s *ServerState) Done() {
@@ -92,6 +93,7 @@ func init() {
 //
 func create_file_index(source_file string) (string, uint64) {
     // Open the source file
+    fmt.Printf("Opening source file '%s'\n", source_file)
     src, err := os.Open(source_file)
     if err != nil {
         fmt.Println(err)
@@ -100,6 +102,7 @@ func create_file_index(source_file string) (string, uint64) {
 
     // Create/truncate an index file
     index_file := source_file + ".idx"
+    fmt.Printf("Opening index file '%s'\n", index_file)
     idx, err := os.Create(index_file)
     if err != nil {
         fmt.Println(err)
@@ -113,25 +116,60 @@ func create_file_index(source_file string) (string, uint64) {
     }()
 
     // Find and mark line beginnings in the source file
-    var offset, eol, lines uint64
+    var offset, lines uint64
     var output [2]uint64
+    var eol, next, rollover, length int
     var w_err error
+    var done bool
+
+    fmt.Println("Searching source file for line endings...")
 
     buffer := make([]byte, 4096)    // Typical Linux page size
-    for n, err := src.Read(buffer); err != nil && n > 1; {
-        eol = uint64(strings.IndexByte(string(buffer), '\n'))
-        if eol >= 0 {
-            // Write index/size of line into index file
-            output[0] = offset
-            output[1]  = uint64(offset + eol + 1)
-            w_err = binary.Write(idx, binary.LittleEndian, output)
-            if w_err != nil {
-                fmt.Println("binary.Write failed:", w_err)
+    for !done {
+
+        n, err := src.Read(buffer);
+        if err != nil {
+            if err == io.EOF {
                 break
             }
-            offset = eol + 1
-            lines++
+            fmt.Println(err)
+            return "", uint64(0)
         }
+        fmt.Printf("Read %d bytes\n", n)
+
+        for s := string(buffer)[:n]; eol >= 0; {
+            eol = strings.IndexByte(s, '\n')
+            if eol >= 0 {
+                fmt.Printf("nl-index %d  rollover %d\n", eol, rollover)
+
+                next = eol + 1  // String index of the start of the next line, relative to the current buffer
+                length = next + rollover   // Length of this string, in bytes. Includes any rollover from the previous buffer
+                rollover = 0
+
+                // Write index/size of line into index file
+                output[0] = offset
+                output[1]  = uint64(length)
+                w_err = binary.Write(idx, binary.LittleEndian, output)
+                if w_err != nil {
+                    fmt.Println("binary.Write failed:", w_err)
+                    break
+                }
+
+                fmt.Printf("Line %d: offset %d  length %d  eol %d  next %d\n", lines, output[0], output[1], eol, next)
+                fmt.Printf("Line %d: %s\n", lines, s[:length])
+
+                offset += uint64(length)    // Offset is relative to the beginning of the file, in bytes
+                lines++
+                if next >= len(s) {
+                    break
+                }
+                s = s[next:]                // Slice the string so that it starts at the beginning of the next line
+            } else {
+                rollover = len(s)   // Remember how many characters were leftover in the previous buffer (i.e., a partial line)
+            }
+        }
+        eol = 0
+        fmt.Printf("Buffer rollover: %d\n", rollover)
     }
 
     return index_file, lines
@@ -143,13 +181,15 @@ func create_file_index(source_file string) (string, uint64) {
 // Purpose: Retrieves the text associated with the specified line number
 //
 func get_text(src *os.File, idx *os.File, line uint64, total_lines uint64) string {
-    // Snity check the requested lines against the total number of lines available
-    if line > total_lines {
-        fmt.Printf("Requested line %d exceeds the total number of lines available %d\n", line, total_lines)
+    // Sanity check the requested lines against the total number of lines available
+    if line < 1 || line > total_lines {
+        fmt.Printf("Requested line %d is out of range: { 1, %d }\n", line, total_lines)
         return ""
     }
 
-    var offset uint64 = (line + 1) * (8 * 2)
+    var offset uint64 = (line - 1) * (8 * 2)
+
+    fmt.Printf("get_text: line %d  total_lines %d  offset %d\n", line, total_lines, offset)
 
     // Seek to the correct location in the index file
     _, err := idx.Seek(int64(offset), 0)
@@ -166,6 +206,8 @@ func get_text(src *os.File, idx *os.File, line uint64, total_lines uint64) strin
         fmt.Println("Index binary.Read failed:", err2)
         return ""
     }
+
+    fmt.Printf("get_text: source offset %d  length %d\n", location[0], location[1])
 
     // Seek to the correct location in the source file
     _, err3 := src.Seek(int64(location[0]), 0)
@@ -186,6 +228,8 @@ func get_text(src *os.File, idx *os.File, line uint64, total_lines uint64) strin
         return ""
     }
 
+    fmt.Printf("get_text: Read %d bytes at offset %d: %s\n", n, location[0], string(text))
+
     return string(text)
 }
 
@@ -195,8 +239,6 @@ func get_text(src *os.File, idx *os.File, line uint64, total_lines uint64) strin
 // Purpose: Validates and executes client commands
 //
 func client_handler(client net.Conn, timeout int, state *ServerState, cfg *ClientConfig) {
-    state.Starting() // Increment the WaitGroup
-
     // client handler closure
     defer func() {
         fmt.Printf("Closing socket to %s\n", client.RemoteAddr().String())
@@ -208,6 +250,8 @@ func client_handler(client net.Conn, timeout int, state *ServerState, cfg *Clien
     timeoutDuration := time.Duration(timeout) * time.Second
     reader := bufio.NewReader(client)
     done := false
+    reply := "Huh?\r\n"
+//    w = bufio.NewWriter(conn)
 
     // Open the source file
     src, err := os.Open(cfg.GetSource())
@@ -253,22 +297,28 @@ func client_handler(client net.Conn, timeout int, state *ServerState, cfg *Clien
 
         switch cmd {
         case "QUIT":
+            fmt.Println("Command: QUIT")
             done = true
         case "SHUTDOWN":
+            fmt.Println("Command: SHUTDOWN")
             done = true
             state.InitiateShutdown() // Signal server to exit
         default:    // Per regex matching, this can only be the GET nnnn command
+            fmt.Println("Command: " + cmd)
             if line, err2 := strconv.ParseUint(s[2], 10, 64); err2 == nil {
                 text := get_text(src, idx, line, cfg.GetLines())
                 if text != "" {
-                    msg = "OK\r\n" + text + "\r\n"
+                    text = strings.TrimSpace(text)
+                    reply = "OK\r\n" + text + "\r\n"
                 } else {
-                    msg  = "ERR\r\n"
+                    reply  = "ERR\r\n"
                 }
             } else {
-                msg = "ERR\r\n"
+                reply = "ERR\r\n"
             }
-            client.Write([]byte(msg))
+            fmt.Printf("Sending: " + reply)
+            client.Write([]byte(reply))
+//            client.Flush()
         }
     }
 }
@@ -286,8 +336,9 @@ func wait_for_clients(listen_conn net.Listener, timeout int, state *ServerState,
     defer func() {
         fmt.Printf("Closing listener on %s:%s\n", listen_conn.Addr().Network(), listen_conn.Addr().String())
         listen_conn.Close() // Close listener socket
-        state.Done()        // Decrement the WaitGroup
     }()
+
+    fmt.Printf("Listening for clients on %s:%s\n", listen_conn.Addr().Network(), listen_conn.Addr().String())
 
     // Main loop for launching new clients
     for {
@@ -310,6 +361,7 @@ func wait_for_clients(listen_conn net.Listener, timeout int, state *ServerState,
 
         // Launch new client handler
         fmt.Printf("Connection from %s\n", client.RemoteAddr().String())
+        state.Starting() // Increment the WaitGroup
         go client_handler(client, 10, state, cfg)
     }
 }
@@ -339,10 +391,14 @@ func main() {
     }
 
     // Pre-process the specified text file
+    fmt.Printf("Creating file index on '%s'\n", flag.Arg(0))
+
     index_file, lines := create_file_index(flag.Arg(0))
     if index_file == "" {
         return
     }
+
+    fmt.Printf("Creating listener on port %d\n", listen_port)
 
     listen_addr := ":" + strconv.Itoa(listen_port)
     listen_conn, err := net.Listen("tcp4", listen_addr)
@@ -360,7 +416,11 @@ func main() {
     // Wait for new client connections until the SHTUDOWN is received by one of the clients
     wait_for_clients(listen_conn, 2, &state, &cfg)
 
+    fmt.Println("Server waiting on all outstanding GoRoutines to exit...")
+
     state.Wait()   // Wait for all goroutines to exit
+
+    fmt.Println("Server shutting down")
 
     os.Exit(0)
 }
